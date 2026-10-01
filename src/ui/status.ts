@@ -26,10 +26,7 @@ export function statusMessage(c: Circuit, r: SolveResult): StatusMessage | null 
     }
     case 'error':
       return { level: 'danger', text: 'Não foi possível resolver este circuito.' };
-    case 'open':
-      return { level: 'warning', text: 'Circuito aberto: não há um caminho fechado entre os terminais da pilha, por isso não passa corrente.' };
   }
-  if (!r.converged) return { level: 'warning', text: 'O cálculo não convergiu. Os valores podem estar errados.' };
   const burnt = c.elements.filter((e) => e.kind === 'led' && e.burnt);
   if (burnt.length) {
     return {
@@ -37,5 +34,9 @@ export function statusMessage(c: Circuit, r: SolveResult): StatusMessage | null 
       text: `O LED ${burnt.map((e) => e.name).join(', ')} queimou: passou dos 30 mA. Põe uma resistência maior em série e substitui-o.`,
     };
   }
+  if (r.status === 'open') {
+    return { level: 'warning', text: 'Circuito aberto: não há um caminho fechado entre os terminais da pilha, por isso não passa corrente.' };
+  }
+  if (!r.converged) return { level: 'warning', text: 'O cálculo não convergiu. Os valores podem estar errados.' };
   return null;
 }
