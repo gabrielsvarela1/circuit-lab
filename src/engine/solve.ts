@@ -14,23 +14,45 @@ import { PotentialUnionFind, UnionFind } from './unionfind';
 const MAX_ITERATIONS = 500;
 const TOLERANCE = 1e-9;
 
+/** A lamp blows when its current goes above this multiple of its rated current. */
+export const LAMP_OVERLOAD = 1.5;
+
+/**
+ * Loops of ideal AC sources are also checked at these instants, so a loop is
+ * not mistaken for a valid one just because the sine happens to be zero at `t`.
+ */
+const PROBE_TIMES = [0.013717, 0.029113];
+
 /** Ideal conductors: their two terminals become a single node. */
 export function isLink(p: Part): boolean {
   if (p.kind === 'wire') return true;
   if (p.kind === 'switch') return !!p.closed;
-  if (p.kind === 'resistor' || p.kind === 'lamp') return !((p.value ?? 0) > 0);
+  if (p.kind === 'resistor') return !((p.value ?? 0) > 0);
+  if (p.kind === 'lamp') return !p.burnt && !((p.value ?? 0) > 0);
   return false;
+}
+
+/** Batteries and AC sources. */
+export function isGenerator(p: Part): boolean {
+  return p.kind === 'battery' || p.kind === 'ac';
+}
+
+/** Ideal voltage sources: ammeters, and generators without internal resistance. */
+function isIdealSource(p: Part): boolean {
+  return p.kind === 'ammeter' || (isGenerator(p) && !((p.r ?? 0) > 0));
 }
 
 /** Parts that carry current between two different nodes and appear in the MNA system. */
 function isBranch(p: Part): boolean {
   switch (p.kind) {
     case 'battery':
+    case 'ac':
     case 'ammeter':
       return true;
     case 'resistor':
-    case 'lamp':
       return (p.value ?? 0) > 0;
+    case 'lamp':
+      return !p.burnt && (p.value ?? 0) > 0;
     case 'led':
       return !p.burnt;
     default:
@@ -38,12 +60,18 @@ function isBranch(p: Part): boolean {
   }
 }
 
-function isSource(p: Part): boolean {
-  return p.kind === 'battery' || p.kind === 'ammeter';
+/** EMF at time t. An AC source's `value` is its RMS voltage. */
+export function emfAt(p: Part, t: number): number {
+  if (p.kind === 'battery') return p.value ?? 0;
+  if (p.kind === 'ac') return Math.SQRT2 * (p.value ?? 0) * Math.sin(2 * Math.PI * (p.freq ?? 50) * t);
+  return 0;
 }
 
-function emf(p: Part): number {
-  return p.kind === 'battery' ? p.value ?? 0 : 0;
+/** Current above which a part burns, or Infinity. */
+export function burnLimit(p: Part): number {
+  if (p.kind === 'led') return LED_MAX_CURRENT;
+  if (p.kind === 'lamp' && (p.value ?? 0) > 0) return (LAMP_OVERLOAD * (p.rated ?? 6)) / p.value!;
+  return Infinity;
 }
 
 function emptyResult(parts: Part[]): SolveResult {
@@ -56,6 +84,7 @@ function emptyResult(parts: Part[]): SolveResult {
     overCurrent: [],
     converged: true,
     iterations: 0,
+    ac: parts.some((p) => p.kind === 'ac'),
   };
   for (const p of parts) {
     result.parts.set(p.id, { v: 0, i: 0, p: 0 });
@@ -66,23 +95,25 @@ function emptyResult(parts: Part[]): SolveResult {
 }
 
 /**
- * Solves a DC circuit with modified nodal analysis.
+ * Solves the circuit at time `t` (which only matters for AC sources) with
+ * modified nodal analysis.
  *
  * 1. Wires and closed switches merge their terminals into one node (union-find).
- * 2. Batteries and ammeters are ideal voltage sources. Adding them to a
- *    union-find that tracks potentials detects loops of sources: a loop with a
- *    net EMF is a short circuit.
+ * 2. Ammeters and generators without internal resistance are ideal voltage
+ *    sources. Adding them to a union-find that tracks potentials detects loops
+ *    of sources: a loop with a net EMF is a short circuit.
  * 3. Each connected part of the circuit gets its own reference node.
- * 4. Resistors, lamps and LEDs are stamped as conductances, sources as extra
- *    rows and columns, and the system is solved by Gaussian elimination.
- *    LEDs are non-linear, so this repeats with Newton's method until the LED
- *    voltages stop changing.
+ * 4. Resistors and lamps are stamped as conductances, generators with internal
+ *    resistance as their Norton equivalent, ideal sources as extra rows and
+ *    columns, and the system is solved by Gaussian elimination. LEDs are
+ *    non-linear, so this repeats with Newton's method until the LED voltages
+ *    stop changing.
  * 5. Currents in the wires are recovered afterwards from Kirchhoff's current law.
  */
-export function solve(parts: Part[]): SolveResult {
+export function solve(parts: Part[], t = 0): SolveResult {
   const result = emptyResult(parts);
-  const batteries = parts.filter((p) => p.kind === 'battery');
-  if (batteries.length === 0) return result;
+  const generators = parts.filter(isGenerator);
+  if (generators.length === 0) return result;
 
   // 1. Merge nodes joined by ideal conductors.
   const nodeSets = new UnionFind();
@@ -90,27 +121,31 @@ export function solve(parts: Part[]): SolveResult {
   for (const l of links) nodeSets.union(l.a, l.b);
   const group = (node: string) => nodeSets.find(node);
 
-  // 2. Add sources, looking for loops of sources.
-  const potentials = new PotentialUnionFind();
+  // 2. Add ideal sources, looking for loops of sources.
+  const times = [t, ...PROBE_TIMES];
+  const potentials = times.map(() => new PotentialUnionFind());
   const sources: Part[] = [];
   const redundant = new Set<string>();
   for (const p of parts) {
-    if (!isSource(p)) continue;
+    if (!isIdealSource(p)) continue;
     const ga = group(p.a);
     const gb = group(p.b);
-    const e = emf(p);
-    const diff = potentials.difference(ga, gb);
-    if (diff === undefined) {
-      potentials.union(ga, gb, e);
+    if (potentials[0].difference(ga, gb) === undefined) {
+      potentials.forEach((pu, k) => pu.union(ga, gb, emfAt(p, times[k])));
       sources.push(p);
-    } else if (Math.abs(diff - e) > 1e-9 * Math.max(1, Math.abs(e))) {
+      continue;
+    }
+    const consistent = potentials.every((pu, k) => {
+      const e = emfAt(p, times[k]);
+      return Math.abs(pu.difference(ga, gb)! - e) <= 1e-9 * Math.max(1, Math.abs(e));
+    });
+    if (!consistent) {
       result.status = 'short';
       result.shortLoop = shortLoop(p, sources, links, group);
       return result;
-    } else {
-      // Same EMF as a parallel source: it carries no current of its own.
-      redundant.add(p.id);
     }
+    // Same EMF as a parallel source: it carries no current of its own.
+    redundant.add(p.id);
   }
 
   // 3. Connected parts of the circuit and their reference nodes.
@@ -118,9 +153,9 @@ export function solve(parts: Part[]): SolveResult {
   const islands = new UnionFind();
   for (const b of branches) islands.union(group(b.a), group(b.b));
   const reference = new Map<string, string>();
-  for (const b of batteries) {
-    const island = islands.find(group(b.b));
-    if (!reference.has(island)) reference.set(island, group(b.b));
+  for (const g of generators) {
+    const island = islands.find(group(g.b));
+    if (!reference.has(island)) reference.set(island, group(g.b));
   }
   const groups = new Set<string>();
   for (const p of parts) {
@@ -138,6 +173,7 @@ export function solve(parts: Part[]): SolveResult {
   const n = index.size;
   const size = n + sources.length;
   const resistors = branches.filter((p) => p.kind === 'resistor' || p.kind === 'lamp');
+  const norton = branches.filter((p) => isGenerator(p) && !isIdealSource(p));
   const leds = branches.filter((p) => p.kind === 'led');
   const models: LedModel[] = leds.map((p) => ledModel(p.vf));
   const vd = leds.map(() => 0);
@@ -174,6 +210,11 @@ export function solve(parts: Part[]): SolveResult {
     };
 
     for (const r of resistors) conductance(r.a, r.b, 1 / r.value!);
+    for (const g of norton) {
+      // E in series with r equals 1/r in parallel with a current E/r pushed out of a.
+      conductance(g.a, g.b, 1 / g.r!);
+      current(g.a, g.b, -emfAt(g, t) / g.r!);
+    }
     leds.forEach((led, k) => {
       // Linearise around the current guess: i = g * v + (id - g * vd).
       const g = ledConductance(models[k], vd[k]);
@@ -193,7 +234,7 @@ export function solve(parts: Part[]): SolveResult {
         A[ib][row] -= 1;
         A[row][ib] -= 1;
       }
-      z[row] = emf(s);
+      z[row] = emfAt(s, t);
     });
 
     try {
@@ -226,34 +267,93 @@ export function solve(parts: Part[]): SolveResult {
   for (const p of parts) {
     const v = sameIsland(p.a, p.b) ? voltage(p.a) - voltage(p.b) : NaN;
     if (isLink(p)) continue;
-    if (isSource(p)) {
+    if (isIdealSource(p)) {
       const k = sourceIndex.get(p.id);
-      set(p, emf(p), k === undefined ? 0 : x[k]);
-    } else if (p.kind === 'resistor' || p.kind === 'lamp') {
+      set(p, emfAt(p, t), k === undefined ? 0 : x[k]);
+    } else if (isGenerator(p)) {
+      set(p, v, (v - emfAt(p, t)) / p.r!);
+    } else if ((p.kind === 'resistor' || p.kind === 'lamp') && isBranch(p)) {
       set(p, v, v / p.value!);
     } else if (p.kind === 'led' && !p.burnt) {
-      const i = ledCurrent(models[ledIndex.get(p.id)!], v);
-      set(p, v, i);
-      if (i > LED_MAX_CURRENT) result.overCurrent.push(p.id);
+      set(p, v, ledCurrent(models[ledIndex.get(p.id)!], v));
     } else {
-      // Voltmeter, open switch, burnt LED: no current.
+      // Voltmeter, open switch, burnt LED or lamp: no current.
       set(p, v, 0);
     }
   }
+  result.overCurrent = overLimit(parts, (p) => Math.abs(result.parts.get(p.id)!.i));
 
   // 5. Currents in wires and closed switches.
   const currents = linkCurrents(parts, links, (p) => result.parts.get(p.id)!.i);
   for (const l of links) set(l, 0, currents.get(l.id) ?? 0);
 
-  // Batteries with no closed path.
-  for (const b of batteries) {
-    if (redundant.has(b.id)) continue;
+  // Generators with no closed path.
+  for (const g of generators) {
+    if (redundant.has(g.id)) continue;
     const others = new UnionFind();
-    for (const p of branches) if (p !== b) others.union(group(p.a), group(p.b));
-    if (!others.connected(group(b.a), group(b.b))) result.openSources.push(b.id);
+    for (const p of branches) if (p !== g) others.union(group(p.a), group(p.b));
+    if (!others.connected(group(g.a), group(g.b))) result.openSources.push(g.id);
   }
-  const live = batteries.filter((b) => !redundant.has(b.id));
+  const live = generators.filter((g) => !redundant.has(g.id));
   result.status = result.openSources.length === live.length ? 'open' : 'ok';
+  return result;
+}
+
+/** Ids of the parts above their burn limit, the worst (highest ratio) first. */
+function overLimit(parts: Part[], current: (p: Part) => number): string[] {
+  return parts
+    .filter((p) => !p.burnt && burnLimit(p) < Infinity && current(p) > burnLimit(p))
+    .map((p) => ({ id: p.id, ratio: current(p) / burnLimit(p) }))
+    .sort((x, y) => y.ratio - x.ratio)
+    .map((x) => x.id);
+}
+
+/**
+ * Steady state. With only DC generators this is `solve`. With AC sources the
+ * circuit is solved at evenly spaced instants over one period (every part is
+ * resistive or an LED, so each instant is independent of the others) and the
+ * result holds RMS voltage and current and average power, as a multimeter
+ * shows them. An LED burns on its peak current, a lamp on its RMS current.
+ */
+export function analyse(parts: Part[]): SolveResult {
+  const acs = parts.filter((p) => p.kind === 'ac');
+  if (acs.length === 0) return solve(parts);
+
+  const freqs = acs.map((p) => p.freq ?? 50);
+  const fmin = Math.min(...freqs);
+  const fmax = Math.max(...freqs);
+  const period = 1 / fmin;
+  const samples = Math.min(512, Math.max(64, Math.ceil((64 * fmax) / fmin)));
+
+  const first = solve(parts, 0);
+  if (first.status === 'short' || first.status === 'error' || first.status === 'empty') return first;
+
+  const sum = new Map<string, { v2: number; i2: number; p: number; peak: number }>();
+  const nodes2 = new Map<string, number>();
+  let converged = true;
+  let iterations = 0;
+  for (let k = 0; k < samples; k++) {
+    const r = k === 0 ? first : solve(parts, (k * period) / samples);
+    if (r.status === 'error') return r;
+    converged &&= r.converged;
+    iterations = Math.max(iterations, r.iterations);
+    for (const [id, x] of r.parts) {
+      const s = sum.get(id) ?? { v2: 0, i2: 0, p: 0, peak: 0 };
+      s.v2 += x.v * x.v;
+      s.i2 += x.i * x.i;
+      s.p += x.p;
+      s.peak = Math.max(s.peak, Math.abs(x.i));
+      sum.set(id, s);
+    }
+    for (const [node, v] of r.nodes) nodes2.set(node, (nodes2.get(node) ?? 0) + v * v);
+  }
+
+  const result: SolveResult = { ...first, parts: new Map(), nodes: new Map(), converged, iterations };
+  for (const [id, s] of sum) {
+    result.parts.set(id, { v: Math.sqrt(s.v2 / samples), i: Math.sqrt(s.i2 / samples), p: s.p / samples });
+  }
+  for (const [node, v2] of nodes2) result.nodes.set(node, Math.sqrt(v2 / samples));
+  result.overCurrent = overLimit(parts, (p) => (p.kind === 'led' ? sum.get(p.id)!.peak : result.parts.get(p.id)!.i));
   return result;
 }
 
@@ -315,20 +415,17 @@ function bfs(
 }
 
 /**
- * Solves the circuit and burns any LED above its maximum current, one at a
- * time (the worst first), until no LED is over the limit. Returns the updated
- * parts and the ids of the LEDs that burnt.
+ * Solves the circuit and burns any LED or lamp above its limit, one at a time
+ * (the worst first), until nothing is over the limit. Returns the updated
+ * parts and the ids of what burnt.
  */
 export function solveWithBurnout(parts: Part[]): { parts: Part[]; result: SolveResult; burnt: string[] } {
   const burnt: string[] = [];
   let current = parts;
   for (;;) {
-    const result = solve(current);
+    const result = analyse(current);
     if (result.overCurrent.length === 0) return { parts: current, result, burnt };
-    let worst = result.overCurrent[0];
-    for (const id of result.overCurrent) {
-      if (result.parts.get(id)!.i > result.parts.get(worst)!.i) worst = id;
-    }
+    const worst = result.overCurrent[0];
     burnt.push(worst);
     current = current.map((p) => (p.id === worst ? { ...p, burnt: true } : p));
   }
@@ -336,9 +433,9 @@ export function solveWithBurnout(parts: Part[]): { parts: Part[]; result: SolveR
 
 /** 0 to 1. LEDs by current relative to 20 mA, lamps relative to their rated current. */
 export function brightness(p: Part, r: PartResult | undefined): number {
-  if (!r) return 0;
+  if (!r || p.burnt) return 0;
   const clamp = (x: number) => Math.min(1, Math.max(0, x));
-  if (p.kind === 'led') return p.burnt ? 0 : clamp(r.i / 0.02);
+  if (p.kind === 'led') return clamp(r.i / 0.02);
   if (p.kind === 'lamp' && (p.value ?? 0) > 0) {
     const ratedCurrent = (p.rated ?? 6) / p.value!;
     return clamp(Math.abs(r.i) / ratedCurrent);
