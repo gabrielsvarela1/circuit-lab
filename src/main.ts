@@ -22,6 +22,7 @@ import { Board } from './ui/board';
 import { Panel } from './ui/panel';
 import { statusMessage } from './ui/status';
 import { meterLetter, symbol } from './ui/symbols';
+import { ExerciseView } from './ui/exercises';
 import { tooltipHtml } from './ui/tooltip';
 
 class App {
@@ -33,6 +34,7 @@ class App {
   showValues = true;
   board: Board;
   panel: Panel;
+  exercises: ExerciseView;
   private status = document.querySelector<HTMLElement>('.status')!;
   private tooltip = document.querySelector<HTMLElement>('.tooltip')!;
   private hovered: { id: string; at: { x: number; y: number } } | null = null;
@@ -69,7 +71,18 @@ class App {
       remove: (id) => this.removeItem(id),
     });
 
+    this.exercises = new ExerciseView(document.querySelector<HTMLElement>('.exercise')!, {
+      load: (c) => this.open(c),
+      apply: (c) => this.commit(c),
+      setShowValues: (show) => {
+        this.showValues = show;
+        this.render();
+      },
+      closed: () => this.render(),
+    });
+
     this.buildPalette();
+    this.buildExamples();
     this.bindCommands();
     document.addEventListener('pointerdown', (e) => (this.lastPointer = e.pointerType), true);
     window.addEventListener('resize', () => this.updateTooltip());
@@ -263,6 +276,25 @@ class App {
     }
   }
 
+  private buildExamples(): void {
+    const dialog = document.querySelector<HTMLDialogElement>('dialog.examples')!;
+    const list = dialog.querySelector('.example-list')!;
+    list.innerHTML = EXAMPLES.map(
+      (ex, k) => `<li><button data-example="${k}"><strong>${ex.title}</strong><span>${ex.description}</span></button></li>`,
+    ).join('');
+    list.addEventListener('click', (e) => {
+      const button = (e.target as HTMLElement).closest<HTMLElement>('[data-example]');
+      if (!button) return;
+      dialog.close();
+      if (this.exercises.active) this.exercises.close();
+      this.open(EXAMPLES[Number(button.dataset.example)].build());
+    });
+    // Click on the backdrop closes the dialog.
+    dialog.addEventListener('click', (e) => {
+      if (e.target === dialog) dialog.close();
+    });
+  }
+
   private bindCommands(): void {
     const commands: Record<string, () => void> = {
       undo: () => this.history.undo() && this.render(),
@@ -272,6 +304,9 @@ class App {
         this.commit(empty());
       },
       share: () => this.share(),
+      examples: () => document.querySelector<HTMLDialogElement>('dialog.examples')!.showModal(),
+      'close-examples': () => document.querySelector<HTMLDialogElement>('dialog.examples')!.close(),
+      exercises: () => (this.exercises.active ? this.exercises.close() : this.exercises.showList()),
       'zoom-in': () => this.board.zoom(1.25),
       'zoom-out': () => this.board.zoom(0.8),
       fit: () => this.board.fit(this.circuit),

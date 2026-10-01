@@ -10,6 +10,10 @@
   <body>
     <header class="top">
       <h1>Circuit Lab</h1>
+      <nav class="learn">
+        <button data-cmd="examples">Exemplos</button>
+        <button data-cmd="exercises">Exercícios</button>
+      </nav>
       <nav class="toolbar">
         <button data-cmd="undo" title="Anular (Ctrl+Z)">Anular</button>
         <button data-cmd="redo" title="Refazer (Ctrl+Y)">Refazer</button>
@@ -29,8 +33,13 @@
           <button data-cmd="fit" aria-label="Ajustar à vista">Ajustar</button>
         </div>
       </section>
+      <section class="exercise" aria-label="Exercício" hidden></section>
       <aside class="panel"></aside>
     </main>
+    <dialog class="examples">
+      <div class="ex-head"><h2>Exemplos</h2><button data-cmd="close-examples">Fechar</button></div>
+      <ul class="example-list"></ul>
+    </dialog>
     <div class="toast" role="status" hidden></div>
     <script type="module" src="/src/main.ts"></script>
   </body>
