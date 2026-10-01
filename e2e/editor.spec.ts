@@ -113,3 +113,33 @@ test('the circuit survives a reload and can be shared by URL', async ({ page, br
   expect(other.url()).not.toContain('#c=');
   await context.close();
 });
+
+test('a wire can be selected and deleted', async ({ page }) => {
+  // The bottom wire of the default circuit runs from (6,3) to (0,3).
+  await tapGrid(page, { x: 3, y: 3 });
+  await expect(page.locator('.panel h2')).toHaveText('Fio');
+  await expect(page.locator('.panel .readings')).toContainText('20 mA');
+  await page.locator('.panel [data-action=remove]').click();
+  await expect(page.locator('.status')).toContainText('Circuito aberto');
+});
+
+test('two fingers zoom the view on a phone', async ({ page }, info) => {
+  test.skip(info.project.name !== 'mobile', 'touch only');
+  const scale = () => page.evaluate(() => (window as any).app.board.camera.scale);
+  const before = await scale();
+  const box = (await page.locator('.board').boundingBox())!;
+  const cx = box.x + box.width / 2;
+  const cy = box.y + box.height / 2;
+  const cdp = await page.context().newCDPSession(page);
+  const fingers = (d: number) => [
+    { x: cx - d, y: cy, id: 0 },
+    { x: cx + d, y: cy, id: 1 },
+  ];
+  await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: fingers(40) });
+  for (let d = 45; d <= 100; d += 5) await cdp.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: fingers(d) });
+  await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+  expect(await scale()).toBeGreaterThan(before * 1.5);
+  // Pinching must not move or add anything.
+  await expect(page.locator('.board .element')).toHaveCount(3);
+  await expect(page.locator('.board .wire')).toHaveCount(7);
+});
