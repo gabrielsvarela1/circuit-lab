@@ -28,6 +28,18 @@ export interface BoardHost {
   commit(c: Circuit): void;
   select(id: string | null): void;
   toggle(id: string): void;
+  /** Element or wire under the mouse, and the mouse position. */
+  hover(id: string | null, at: Point | null): void;
+}
+
+/** Speed of the current dots in pixels per second per ampere, and the cap. */
+const FLOW_SPEED = 3000;
+const FLOW_MAX = 400;
+
+interface Flow {
+  line: SVGLineElement;
+  id: string;
+  speed: number;
 }
 
 type Gesture =
@@ -49,6 +61,10 @@ export class Board {
   private pointers = new Map<number, Point>();
   private gesture: Gesture = { type: 'none' };
   private view: View | null = null;
+  private flows: Flow[] = [];
+  /** Dot offset of each wire, kept across renders so the dots do not jump. */
+  private phase = new Map<string, number>();
+  private hovered: string | null = null;
 
   constructor(
     svg: SVGSVGElement,
@@ -81,6 +97,9 @@ export class Board {
     svg.addEventListener('pointercancel', (e) => this.cancel(e));
     svg.addEventListener('wheel', (e) => this.wheel(e), { passive: false });
     svg.addEventListener('contextmenu', (e) => e.preventDefault());
+    svg.addEventListener('pointerleave', (e) => {
+      if (e.pointerType === 'mouse') this.setHover(null, null);
+    });
   }
 
   // Camera -----------------------------------------------------------------
@@ -171,6 +190,20 @@ export class Board {
     }
     this.layers.wires.innerHTML = wires;
 
+    // Current dots: speed proportional to the current, direction from (x1, y1) to (x2, y2) when positive.
+    this.flows = [];
+    if (result?.status === 'ok') {
+      for (const line of this.layers.wires.querySelectorAll<SVGLineElement>('line.flow')) {
+        const id = line.dataset.flow!;
+        const i = parts?.get(id)?.i ?? 0;
+        if (Math.abs(i) < 1e-6) continue;
+        line.classList.add('on');
+        const speed = Math.sign(i) * Math.min(FLOW_MAX, Math.abs(i) * FLOW_SPEED);
+        this.flows.push({ line, id, speed });
+        line.style.strokeDashoffset = String(-(this.phase.get(id) ?? 0));
+      }
+    }
+
     let elements = '';
     let labels = '';
     for (const e of circuit.elements) {
@@ -230,6 +263,7 @@ export class Board {
 
   private down(e: PointerEvent): void {
     if (!this.view) return;
+    this.setHover(null, null);
     this.svg.setPointerCapture(e.pointerId);
     this.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
 
@@ -272,7 +306,28 @@ export class Board {
     };
   }
 
+  /** Advances the current dots by dt seconds. */
+  tick(dt: number): void {
+    for (const f of this.flows) {
+      const phase = ((this.phase.get(f.id) ?? 0) + f.speed * dt) % 10000;
+      this.phase.set(f.id, phase);
+      f.line.style.strokeDashoffset = String(-phase);
+    }
+  }
+
+  private setHover(id: string | null, at: Point | null): void {
+    if (id === this.hovered && !id) return;
+    this.hovered = id;
+    this.host.hover(id, at);
+  }
+
   private moveEvent(e: PointerEvent): void {
+    if (e.pointerType === 'mouse' && this.gesture.type === 'none') {
+      const target = e.target as globalThis.Element;
+      const item = target.closest('[data-id]') ?? target.closest('[data-wire]');
+      const id = item?.getAttribute('data-id') ?? item?.getAttribute('data-wire') ?? null;
+      this.setHover(id, id ? { x: e.clientX, y: e.clientY } : null);
+    }
     if (!this.pointers.has(e.pointerId)) return;
     const prev = this.pointers.get(e.pointerId)!;
     this.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
@@ -402,10 +457,6 @@ export class Board {
     }
   }
 
-  /** Flow lines for the current animation (phase 3 uses them). */
-  flowLines(): NodeListOf<SVGLineElement> {
-    return this.layers.wires.querySelectorAll<SVGLineElement>('line.flow');
-  }
 }
 
 function valueText(e: Element): string {

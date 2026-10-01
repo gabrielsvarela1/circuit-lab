@@ -305,6 +305,30 @@ kbd {
   margin-bottom: 12px;
 }
 
+.tooltip {
+  position: absolute;
+  left: 0;
+  top: 0;
+  z-index: 3;
+  pointer-events: none;
+  background: rgba(28, 36, 48, 0.94);
+  color: #fff;
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 13px;
+  line-height: 1.45;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.tooltip .muted {
+  color: #c3cad4;
+}
+
+.tooltip .warning {
+  color: #ffc857;
+}
+
 .toast {
   position: fixed;
   left: 50%;
@@ -361,6 +385,13 @@ kbd {
 .flow {
   stroke: none;
   pointer-events: none;
+}
+
+.flow.on {
+  stroke: var(--flow);
+  stroke-width: 6;
+  stroke-linecap: round;
+  stroke-dasharray: 0.01 24;
 }
 
 .lead,
