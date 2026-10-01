@@ -22,6 +22,7 @@ import { Board } from './ui/board';
 import { Panel } from './ui/panel';
 import { statusMessage } from './ui/status';
 import { meterLetter, symbol } from './ui/symbols';
+import { tooltipHtml } from './ui/tooltip';
 
 class App {
   history: History;
@@ -33,6 +34,9 @@ class App {
   board: Board;
   panel: Panel;
   private status = document.querySelector<HTMLElement>('.status')!;
+  private tooltip = document.querySelector<HTMLElement>('.tooltip')!;
+  private hovered: { id: string; at: { x: number; y: number } } | null = null;
+  private lastPointer = 'mouse';
   private toastTimer = 0;
 
   constructor() {
@@ -50,6 +54,10 @@ class App {
         this.selected = id;
         this.render();
       },
+      hover: (id, at) => {
+        this.hovered = id && at ? { id, at } : null;
+        this.updateTooltip();
+      },
       toggle: (id) => {
         const e = this.circuit.elements.find((x) => x.id === id);
         if (e) this.commit(update(this.circuit, id, { closed: !e.closed }));
@@ -63,6 +71,9 @@ class App {
 
     this.buildPalette();
     this.bindCommands();
+    document.addEventListener('pointerdown', (e) => (this.lastPointer = e.pointerType), true);
+    window.addEventListener('resize', () => this.updateTooltip());
+    this.animate();
     this.render();
     this.board.fit(this.circuit);
 
@@ -129,6 +140,56 @@ class App {
     document.querySelector<HTMLButtonElement>('[data-cmd=undo]')!.disabled = !this.history.canUndo;
     document.querySelector<HTMLButtonElement>('[data-cmd=redo]')!.disabled = !this.history.canRedo;
     if (!this.draft) save(this.history.present);
+    this.updateTooltip();
+  }
+
+  /**
+   * With a mouse the tooltip follows the hovered item. On touch screens it
+   * sits above the selected item, since there is no hover.
+   */
+  updateTooltip(): void {
+    const stage = this.tooltip.parentElement!.getBoundingClientRect();
+    let id: string | null = null;
+    let x = 0;
+    let y = 0;
+    if (this.hovered && !this.draft) {
+      ({ id } = this.hovered);
+      x = this.hovered.at.x + 14;
+      y = this.hovered.at.y + 18;
+    } else if (this.selected && this.lastPointer !== 'mouse' && !this.draft) {
+      id = this.selected;
+      const e = this.circuit.elements.find((el) => el.id === id);
+      const w = this.circuit.wires.find((wi) => wi.id === id);
+      const centre = e ? { x: e.x, y: e.y } : w ? { x: (w.x1 + w.x2) / 2, y: (w.y1 + w.y2) / 2 } : null;
+      if (!centre) id = null;
+      else {
+        const p = this.board.toClient(centre);
+        x = p.x - 70;
+        // Above the element, or below it when there is no room.
+        y = p.y - 96 < stage.top + 70 ? p.y + 44 : p.y - 96;
+      }
+    }
+    const html = id ? tooltipHtml(this.circuit, id, this.result, this.showValues) : null;
+    this.tooltip.hidden = !html;
+    if (!html) return;
+    this.tooltip.innerHTML = html;
+    const w = this.tooltip.offsetWidth;
+    const h = this.tooltip.offsetHeight;
+    const left = Math.min(Math.max(x - stage.left, 6), stage.width - w - 6);
+    const top = Math.min(Math.max(y - stage.top, 6), stage.height - h - 6);
+    this.tooltip.style.transform = `translate(${left}px, ${top}px)`;
+  }
+
+  private animate(): void {
+    const still = window.matchMedia('(prefers-reduced-motion: reduce)');
+    let last = performance.now();
+    const frame = (now: number) => {
+      const dt = Math.min(0.1, (now - last) / 1000);
+      last = now;
+      if (!still.matches) this.board.tick(dt);
+      requestAnimationFrame(frame);
+    };
+    requestAnimationFrame(frame);
   }
 
   toast(text: string): void {
