@@ -9,7 +9,7 @@ export interface PanelHost {
 }
 
 interface Field {
-  prop: 'value' | 'rated';
+  prop: 'value' | 'rated' | 'r' | 'freq';
   label: string;
   unit: string;
   min: number;
@@ -17,7 +17,15 @@ interface Field {
 }
 
 const FIELDS: Partial<Record<Element['kind'], Field[]>> = {
-  battery: [{ prop: 'value', label: 'Tensão', unit: 'V', min: 0.1, max: 1000 }],
+  battery: [
+    { prop: 'value', label: 'Tensão', unit: 'V', min: 0.1, max: 1000 },
+    { prop: 'r', label: 'Resistência interna', unit: 'Ω', min: 0, max: 1000 },
+  ],
+  ac: [
+    { prop: 'value', label: 'Tensão eficaz', unit: 'V', min: 0.1, max: 1000 },
+    { prop: 'freq', label: 'Frequência', unit: 'Hz', min: 0.1, max: 1000 },
+    { prop: 'r', label: 'Resistência interna', unit: 'Ω', min: 0, max: 1000 },
+  ],
   resistor: [{ prop: 'value', label: 'Resistência', unit: 'Ω', min: 0.1, max: 1e8 }],
   lamp: [
     { prop: 'value', label: 'Resistência', unit: 'Ω', min: 0.1, max: 1e6 },
@@ -31,8 +39,10 @@ const HELP = `
     <li>Arrasta um componente da lista para a grelha, ou toca nele para o adicionar.</li>
     <li>Para ligar, arrasta a partir de um ponto vazio ou de um terminal até outro ponto: fica um fio.</li>
     <li>Toca num componente para o editar, rodar ou apagar. Toca num interruptor para o abrir ou fechar.</li>
-    <li>Roda do rato ou dois dedos para aproximar e mover a vista.</li>
+    <li>Para mudar um fio, toca nele e arrasta uma das pontas.</li>
+    <li>Roda do rato ou dois dedos para aproximar. Para mover a vista com um dedo, liga "Mover vista"; com o rato, usa o botão direito ou mantém <kbd>Espaço</kbd> carregado.</li>
     <li>Atalhos: <kbd>R</kbd> roda, <kbd>Delete</kbd> apaga, <kbd>Ctrl</kbd>+<kbd>Z</kbd> anula, <kbd>Ctrl</kbd>+<kbd>Y</kbd> refaz.</li>
+    <li>Só com o teclado: <kbd>Tab</kbd> até à grelha, setas para mover o cursor, <kbd>Enter</kbd> para começar e acabar um fio, <kbd>Espaço</kbd> para escolher o que está no cursor e <kbd>Shift</kbd>+setas para mover o componente escolhido.</li>
   </ul>`;
 
 /**
@@ -48,7 +58,14 @@ export class Panel {
     private host: PanelHost,
   ) {}
 
-  render(circuit: Circuit, selected: string | null, reading: PartResult | undefined, showValues: boolean, valid = true): void {
+  render(
+    circuit: Circuit,
+    selected: string | null,
+    reading: PartResult | undefined,
+    showValues: boolean,
+    valid = true,
+    ac = false,
+  ): void {
     const element = circuit.elements.find((e) => e.id === selected);
     const wire = circuit.wires.find((w) => w.id === selected);
     const signature = JSON.stringify(element ?? wire ?? null) + showValues;
@@ -59,7 +76,7 @@ export class Panel {
       if (wire) this.root.querySelector('[data-action=remove]')?.addEventListener('click', () => this.host.remove(wire.id));
     }
     const out = this.root.querySelector('.readings');
-    if (out) out.innerHTML = valid ? readings(element, reading, showValues) : '';
+    if (out) out.innerHTML = valid ? readings(element, reading, showValues, ac) : '';
   }
 
   private form(e: Element): string {
@@ -79,7 +96,9 @@ export class Panel {
             (c) => `<option value="${c.vf}" ${c.vf === e.vf ? 'selected' : ''}>${c.name} (${formatNumber(c.vf)} V)</option>`,
           ).join('')}</select></label>
           ${e.burnt ? '<p class="warning">Este LED queimou.</p><button data-action="repair">Substituir LED</button>' : ''}`
-        : '';
+        : e.kind === 'lamp' && e.burnt
+          ? '<p class="warning">Esta lâmpada fundiu.</p><button data-action="repair">Substituir lâmpada</button>'
+          : '';
     const sw =
       e.kind === 'switch'
         ? `<button data-action="toggle">${e.closed ? 'Abrir' : 'Fechar'} interruptor</button>`
@@ -133,14 +152,16 @@ export class Panel {
   }
 }
 
-function readings(e: Element | undefined, r: PartResult | undefined, showValues: boolean): string {
+function readings(e: Element | undefined, r: PartResult | undefined, showValues: boolean, ac: boolean): string {
   if (!r) return '';
   if (!showValues) return '<p class="muted">Os valores ficam escondidos até responderes.</p>';
   const rows: [string, string][] = [];
-  if (!e || e.kind !== 'ammeter') rows.push(['Tensão', formatSI(Math.abs(r.v), 'V')]);
-  if (!e || e.kind !== 'voltmeter') rows.push(['Corrente', formatSI(Math.abs(r.i), 'A')]);
+  const rms = ac ? ' eficaz' : '';
+  const generator = e?.kind === 'battery' || e?.kind === 'ac';
+  if (!e || e.kind !== 'ammeter') rows.push([(generator ? 'Tensão aos terminais' : 'Tensão') + rms, formatSI(Math.abs(r.v), 'V')]);
+  if (!e || e.kind !== 'voltmeter') rows.push(['Corrente' + rms, formatSI(Math.abs(r.i), 'A')]);
   if (e && e.kind !== 'ammeter' && e.kind !== 'voltmeter' && e.kind !== 'switch') {
-    rows.push([e.kind === 'battery' ? 'Potência fornecida' : 'Potência', formatSI(Math.abs(r.p), 'W')]);
+    rows.push([(generator ? 'Potência fornecida' : 'Potência') + (ac ? ' média' : ''), formatSI(Math.abs(r.p), 'W')]);
   }
   return rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('');
 }

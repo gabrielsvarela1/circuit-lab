@@ -20,8 +20,10 @@ export function tooltipHtml(c: Circuit, id: string, r: SolveResult | null, showV
   if (!element) rows = `I = ${i}`;
   else if (kind === 'ammeter') rows = `I = ${formatSI(part.i, 'A')}`;
   else if (kind === 'voltmeter') rows = `V = ${formatSI(part.v, 'V')}`;
+  else if (kind === 'battery' || kind === 'ac') rows = `V = ${v} · I = ${i} · P fornecida = ${p}`;
   else if (kind === 'switch') rows = element.closed ? `I = ${i}` : `V = ${v}`;
   else rows = `V = ${v} · I = ${i} · P = ${p}`;
-  const burnt = element?.burnt ? '<br><span class="warning">Queimado</span>' : '';
-  return `${title}<br>${rows}${burnt}`;
+  const burnt = element?.burnt ? `<br><span class="warning">${element.kind === 'lamp' ? 'Fundida' : 'Queimado'}</span>` : '';
+  const ac = r.ac ? '<br><span class="muted">Valores eficazes</span>' : '';
+  return `${title}<br>${rows}${burnt}${ac}`;
 }
