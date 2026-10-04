@@ -5,18 +5,24 @@ import {
   bounds,
   type Circuit,
   type Element,
+  itemAt,
   junctions,
   key,
+  LABELS,
   move,
+  moveWireEnd,
   normalize,
   type Point,
   terminals,
 } from '../model';
-import { labelPos, meterLetter, symbol, transform, U } from './symbols';
+import { glowStyle, labelPos, meterLetter, symbol, transform, U } from './symbols';
 
 export interface View {
   circuit: Circuit;
+  /** Steady-state result: DC values, or RMS values for AC circuits. */
   result: SolveResult | null;
+  /** Instantaneous result that drives the animation in AC circuits; null for DC. */
+  live: SolveResult | null;
   selected: string | null;
   /** False during exercises: readings stay hidden until the answer is checked. */
   showValues: boolean;
@@ -30,6 +36,8 @@ export interface BoardHost {
   toggle(id: string): void;
   /** Element or wire under the mouse, and the mouse position. */
   hover(id: string | null, at: Point | null): void;
+  /** Text for screen readers (keyboard cursor). */
+  announce(text: string): void;
 }
 
 /** Speed of the current dots in pixels per second per ampere, and the cap. */
@@ -42,21 +50,36 @@ interface Flow {
   speed: number;
 }
 
+/** What a press landed on, to replay as a tap when a pan gesture does not move. */
+interface Tap {
+  element: string | null;
+  wire: string | null;
+}
+
 type Gesture =
   | { type: 'none' }
   | { type: 'press-element'; id: string; start: Point; origin: Circuit; grab: Point }
   | { type: 'drag-element'; id: string; origin: Circuit; grab: Point }
+  | { type: 'press-handle'; id: string; end: 1 | 2; start: Point; origin: Circuit }
+  | { type: 'drag-handle'; id: string; end: 1 | 2; origin: Circuit }
   | { type: 'press-empty'; start: Point; from: Point; wire: string | null }
   | { type: 'wire'; from: Point; to: Point }
-  | { type: 'pan'; last: Point }
+  | { type: 'pan'; last: Point; start: Point; tap: Tap | null }
   | { type: 'pinch'; dist: number; scale: number; world: Point };
+
 const MIN_SCALE = 0.35;
 const MAX_SCALE = 2.5;
 
 export class Board {
   readonly svg: SVGSVGElement;
+  /** One finger (or the left mouse button) moves the view instead of drawing wires. */
+  panMode = false;
+  /** Space is held down: the left mouse button moves the view. */
+  spaceHeld = false;
+  /** True after the board was used with the keyboard, until the next pointer press. */
+  keyboardUsed = false;
   private world: SVGGElement;
-  private layers: Record<'wires' | 'elements' | 'marks' | 'labels' | 'overlay', SVGGElement>;
+  private layers: Record<'wires' | 'elements' | 'marks' | 'labels' | 'overlay' | 'cursor', SVGGElement>;
   private camera = { x: 0, y: 0, scale: 1 };
   private pointers = new Map<number, Point>();
   private gesture: Gesture = { type: 'none' };
@@ -65,6 +88,10 @@ export class Board {
   /** Dot offset of each wire, kept across renders so the dots do not jump. */
   private phase = new Map<string, number>();
   private hovered: string | null = null;
+  /** Keyboard cursor, and the start of a wire being drawn with the keyboard. */
+  cursor: Point = { x: 0, y: 0 };
+  private cursorVisible = false;
+  private keyWireFrom: Point | null = null;
 
   constructor(
     svg: SVGSVGElement,
@@ -79,7 +106,8 @@ export class Board {
       </defs>
       <g class="world">
         <rect class="grid" x="-200000" y="-200000" width="400000" height="400000" fill="url(#grid)"/>
-        <g class="wires"></g><g class="elements"></g><g class="marks"></g><g class="labels"></g><g class="overlay"></g>
+        <g class="wires"></g><g class="elements"></g><g class="marks"></g><g class="labels"></g>
+        <g class="overlay"></g><g class="cursor"></g>
       </g>`;
     this.world = svg.querySelector('.world')!;
     const layer = (name: string) => svg.querySelector<SVGGElement>(`.${name}`)!;
@@ -89,6 +117,7 @@ export class Board {
       marks: layer('marks'),
       labels: layer('labels'),
       overlay: layer('overlay'),
+      cursor: layer('cursor'),
     };
 
     svg.addEventListener('pointerdown', (e) => this.down(e));
@@ -99,6 +128,18 @@ export class Board {
     svg.addEventListener('contextmenu', (e) => e.preventDefault());
     svg.addEventListener('pointerleave', (e) => {
       if (e.pointerType === 'mouse') this.setHover(null, null);
+    });
+    svg.addEventListener('keydown', (e) => this.key(e));
+    svg.addEventListener('focus', () => {
+      if (!svg.matches(':focus-visible')) return;
+      this.cursorVisible = true;
+      this.drawCursor();
+      this.announceCursor();
+    });
+    svg.addEventListener('blur', () => {
+      this.cursorVisible = false;
+      this.keyWireFrom = null;
+      this.drawCursor();
     });
   }
 
@@ -160,13 +201,25 @@ export class Board {
     const r = this.svg.getBoundingClientRect();
     if (r.width === 0 || r.height === 0) return;
     const b = bounds(c) ?? { minX: -4, minY: -3, maxX: 4, maxY: 3 };
-    const margin = 1.5;
-    const w = (b.maxX - b.minX + 2 * margin) * U;
-    const h = (b.maxY - b.minY + 2 * margin) * U;
+    // Wider at the sides, where the labels of vertical parts go.
+    const w = (b.maxX - b.minX + 2 * 2.5) * U;
+    const h = (b.maxY - b.minY + 2 * 1.5) * U;
     const scale = clamp(Math.min(r.width / w, r.height / h), MIN_SCALE, 1.4);
     this.camera.scale = scale;
     this.camera.x = r.width / 2 - ((b.minX + b.maxX) / 2) * U * scale;
     this.camera.y = r.height / 2 - ((b.minY + b.maxY) / 2) * U * scale;
+    this.applyCamera();
+  }
+
+  /** Pans just enough to bring a grid point into view. */
+  private reveal(p: Point): void {
+    const r = this.svg.getBoundingClientRect();
+    const c = this.toClient(p);
+    const pad = U * this.camera.scale;
+    if (c.x < r.left + pad) this.camera.x += r.left + pad - c.x;
+    if (c.x > r.right - pad) this.camera.x -= c.x - (r.right - pad);
+    if (c.y < r.top + pad) this.camera.y += r.top + pad - c.y;
+    if (c.y > r.bottom - pad) this.camera.y -= c.y - (r.bottom - pad);
     this.applyCamera();
   }
 
@@ -177,6 +230,7 @@ export class Board {
     const { circuit, result, selected, showValues } = view;
     const parts = result?.parts;
     const shortLoop = new Set(result?.status === 'short' ? result.shortLoop : []);
+    const ac = !!result?.ac;
 
     let wires = '';
     for (const w of circuit.wires) {
@@ -190,16 +244,12 @@ export class Board {
     }
     this.layers.wires.innerHTML = wires;
 
-    // Current dots: speed proportional to the current, direction from (x1, y1) to (x2, y2) when positive.
+    // Current dots, on every wire while the circuit works; their speed is set in updateLive().
     this.flows = [];
     if (result?.status === 'ok') {
       for (const line of this.layers.wires.querySelectorAll<SVGLineElement>('line.flow')) {
         const id = line.dataset.flow!;
-        const i = parts?.get(id)?.i ?? 0;
-        if (Math.abs(i) < 1e-6) continue;
-        line.classList.add('on');
-        const speed = Math.sign(i) * Math.min(FLOW_MAX, Math.abs(i) * FLOW_SPEED);
-        this.flows.push({ line, id, speed });
+        this.flows.push({ line, id, speed: 0 });
         line.style.strokeDashoffset = String(-(this.phase.get(id) ?? 0));
       }
     }
@@ -207,10 +257,9 @@ export class Board {
     let elements = '';
     let labels = '';
     for (const e of circuit.elements) {
-      const glow = view.result && e.kind !== 'battery' ? this.glowOf(e) : 0;
       const cls = ['element', e.kind, e.id === selected ? 'selected' : '', shortLoop.has(e.id) ? 'short' : ''].join(' ');
       elements += `<g class="${cls}" data-id="${e.id}" transform="${transform(e)}">
-        ${symbol(e.kind, { glow, closed: e.closed, vf: e.vf, burnt: e.burnt })}
+        ${symbol(e.kind, { glow: 0, closed: e.closed, vf: e.vf, burnt: e.burnt })}
         <rect class="hit" x="-28" y="-20" width="56" height="40"/>
       </g>`;
       const letter = meterLetter(e.kind);
@@ -227,7 +276,8 @@ export class Board {
       const r = parts?.get(e.id);
       if ((e.kind === 'ammeter' || e.kind === 'voltmeter') && r) {
         const valid = result?.status !== 'short' && result?.status !== 'error';
-        const reading = !showValues ? '?' : !valid ? '—' : e.kind === 'ammeter' ? formatSI(r.i, 'A') : formatSI(r.v, 'V');
+        const unit = e.kind === 'ammeter' ? 'A' : 'V';
+        const reading = !showValues ? '?' : !valid ? '—' : formatSI(e.kind === 'ammeter' ? r.i : r.v, unit) + (ac ? '~' : '');
         const bottom = labelPos(e, 1);
         labels += `<text class="reading" data-reading="${e.id}" x="${bottom.x}" y="${bottom.y}" text-anchor="${bottom.anchor}">${reading}</text>`;
       }
@@ -235,7 +285,7 @@ export class Board {
     this.layers.elements.innerHTML = elements;
     this.layers.labels.innerHTML = labels;
 
-    // Junction dots and unconnected terminals.
+    // Junction dots, unconnected terminals and the handles of the selected wire.
     let marks = '';
     for (const p of junctions(circuit)) marks += `<circle class="junction" cx="${p.x * U}" cy="${p.y * U}" r="4.5"/>`;
     const count = new Map<string, number>();
@@ -247,22 +297,139 @@ export class Board {
         if (count.get(key(t)) === 1) marks += `<circle class="terminal" cx="${t.x * U}" cy="${t.y * U}" r="3.5"/>`;
       }
     }
+    const wire = circuit.wires.find((w) => w.id === selected);
+    if (wire) {
+      marks += `<circle class="handle" data-handle="${wire.id}" data-end="1" cx="${wire.x1 * U}" cy="${wire.y1 * U}" r="8"/>`;
+      marks += `<circle class="handle" data-handle="${wire.id}" data-end="2" cx="${wire.x2 * U}" cy="${wire.y2 * U}" r="8"/>`;
+    }
     this.layers.marks.innerHTML = marks;
     this.applyCamera();
+    this.updateLive(view.live ?? view.result);
+    this.drawCursor();
   }
 
-  private glowOf(e: Element): number {
-    const r = this.view?.result?.parts.get(e.id);
-    if (!r || !this.view?.showValues) return 0;
-    if (e.kind === 'led') return e.burnt ? 0 : Math.min(1, Math.max(0, r.i / 0.02));
-    if (e.kind === 'lamp' && e.value) return Math.min(1, Math.abs(r.i) / ((e.rated ?? 6) / e.value));
-    return 0;
+  /**
+   * Dot speeds and LED and lamp brightness. Called on render and, in AC
+   * circuits, on every animation frame with the instantaneous result.
+   */
+  updateLive(live: SolveResult | null): void {
+    const view = this.view;
+    if (!view) return;
+    for (const f of this.flows) {
+      const i = live?.parts.get(f.id)?.i ?? 0;
+      f.speed = Math.sign(i) * Math.min(FLOW_MAX, Math.abs(i) * FLOW_SPEED);
+      f.line.classList.toggle('on', Math.abs(i) >= 1e-6);
+    }
+    for (const e of view.circuit.elements) {
+      if (e.kind !== 'led' && e.kind !== 'lamp') continue;
+      // LEDs follow the instantaneous current; a lamp's filament averages it, so it uses the RMS value.
+      const source = e.kind === 'led' ? live : view.result;
+      const r = view.showValues && source?.status === 'ok' ? source.parts.get(e.id) : undefined;
+      let glow = 0;
+      if (r && !e.burnt) {
+        glow = e.kind === 'led' ? r.i / 0.02 : e.value ? Math.abs(r.i) / ((e.rated ?? 6) / e.value) : 0;
+        glow = clamp(glow, 0, 1);
+      }
+      const g = this.layers.elements.querySelector(`[data-id="${e.id}"]`);
+      if (!g) continue;
+      const look = glowStyle(e.kind, glow, e.vf, e.burnt);
+      g.querySelector('.glow')?.setAttribute('opacity', look.glow);
+      g.querySelector('.body')?.setAttribute('style', look.body);
+    }
+  }
+
+  /** Advances the current dots by dt seconds. */
+  tick(dt: number): void {
+    for (const f of this.flows) {
+      const phase = ((this.phase.get(f.id) ?? 0) + f.speed * dt) % 10000;
+      this.phase.set(f.id, phase);
+      f.line.style.strokeDashoffset = String(-phase);
+    }
+  }
+
+  // Keyboard ---------------------------------------------------------------
+
+  private drawCursor(): void {
+    if (!this.cursorVisible) {
+      this.layers.cursor.innerHTML = '';
+      return;
+    }
+    const { x, y } = this.cursor;
+    let html = '';
+    if (this.keyWireFrom) html += wirePreview(this.keyWireFrom, this.cursor);
+    html += `<circle class="kb-cursor" cx="${x * U}" cy="${y * U}" r="11"/>
+      <path class="kb-cursor" d="M${x * U - 18} ${y * U} h8 M${x * U + 10} ${y * U} h8 M${x * U} ${y * U - 18} v8 M${x * U} ${y * U + 10} v8"/>`;
+    this.layers.cursor.innerHTML = html;
+  }
+
+  private announceCursor(): void {
+    const c = this.view?.circuit;
+    const id = c ? itemAt(c, this.cursor) : null;
+    const e = c?.elements.find((x) => x.id === id);
+    const what = e ? `${e.name}, ${LABELS[e.kind]}` : id ? 'fio' : 'vazio';
+    const wire = this.keyWireFrom ? ' A desenhar um fio: Enter termina, Escape cancela.' : '';
+    this.host.announce(`Cursor em ${this.cursor.x}, ${this.cursor.y}: ${what}.${wire}`);
+  }
+
+  /**
+   * Arrows move the cursor (Shift + arrows move the selected component),
+   * Enter starts and ends a wire, Space selects what is under the cursor.
+   */
+  private key(e: KeyboardEvent): void {
+    if (!this.view) return;
+    const arrows: Record<string, Point> = {
+      ArrowLeft: { x: -1, y: 0 },
+      ArrowRight: { x: 1, y: 0 },
+      ArrowUp: { x: 0, y: -1 },
+      ArrowDown: { x: 0, y: 1 },
+    };
+    const d = arrows[e.key];
+    // Only arrows and Enter bring up the cursor; otherwise Space keeps its pan role.
+    if (!this.cursorVisible && !d && e.key !== 'Enter') return;
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    this.keyboardUsed = true;
+    if (!this.cursorVisible) {
+      this.cursorVisible = true;
+      this.cursor = this.centre();
+    }
+    const circuit = this.view.circuit;
+    const selected = circuit.elements.find((x) => x.id === this.view!.selected);
+
+    if (d && e.shiftKey && selected) {
+      const moved = normalize(move(circuit, selected.id, selected.x + d.x, selected.y + d.y));
+      this.host.commit(moved);
+      this.cursor = { x: selected.x + d.x, y: selected.y + d.y };
+    } else if (d) {
+      this.cursor = { x: this.cursor.x + d.x, y: this.cursor.y + d.y };
+    } else if (e.key === 'Enter') {
+      if (!this.keyWireFrom) {
+        this.keyWireFrom = { ...this.cursor };
+      } else {
+        const from = this.keyWireFrom;
+        this.keyWireFrom = null;
+        if (from.x !== this.cursor.x || from.y !== this.cursor.y) this.host.commit(addWire(circuit, from, this.cursor));
+      }
+    } else if (e.key === ' ') {
+      const id = itemAt(circuit, this.cursor);
+      this.host.select(id);
+      if (id && circuit.elements.find((x) => x.id === id)?.kind === 'switch') this.host.toggle(id);
+    } else if (e.key === 'Escape' && this.keyWireFrom) {
+      this.keyWireFrom = null;
+    } else {
+      return;
+    }
+    e.preventDefault();
+    e.stopPropagation();
+    this.reveal(this.cursor);
+    this.drawCursor();
+    this.announceCursor();
   }
 
   // Pointer handling -------------------------------------------------------
 
   private down(e: PointerEvent): void {
     if (!this.view) return;
+    this.keyboardUsed = false;
     this.setHover(null, null);
     this.svg.setPointerCapture(e.pointerId);
     this.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
@@ -276,14 +443,32 @@ export class Board {
     }
     if (this.pointers.size > 2) return;
 
+    const start = { x: e.clientX, y: e.clientY };
+    const target = e.target as globalThis.Element;
+    const el = target.closest('[data-id]');
+    const wire = target.closest('[data-wire]');
+
     if (e.button === 1 || e.button === 2) {
-      this.gesture = { type: 'pan', last: { x: e.clientX, y: e.clientY } };
+      this.gesture = { type: 'pan', last: start, start, tap: null };
+      return;
+    }
+    if (this.panMode || this.spaceHeld) {
+      const tap = { element: el?.getAttribute('data-id') ?? null, wire: wire?.getAttribute('data-wire') ?? null };
+      this.gesture = { type: 'pan', last: start, start, tap };
       return;
     }
 
-    const target = e.target as globalThis.Element;
-    const el = target.closest('[data-id]');
-    const start = { x: e.clientX, y: e.clientY };
+    const handle = target.closest('[data-handle]');
+    if (handle) {
+      this.gesture = {
+        type: 'press-handle',
+        id: handle.getAttribute('data-handle')!,
+        end: handle.getAttribute('data-end') === '1' ? 1 : 2,
+        start,
+        origin: this.view.circuit,
+      };
+      return;
+    }
     if (el) {
       const id = el.getAttribute('data-id')!;
       const item = this.view.circuit.elements.find((x) => x.id === id)!;
@@ -297,22 +482,12 @@ export class Board {
       };
       return;
     }
-    const wire = target.closest('[data-wire]');
     this.gesture = {
       type: 'press-empty',
       start,
       from: this.toGrid(e.clientX, e.clientY),
       wire: wire ? wire.getAttribute('data-wire') : null,
     };
-  }
-
-  /** Advances the current dots by dt seconds. */
-  tick(dt: number): void {
-    for (const f of this.flows) {
-      const phase = ((this.phase.get(f.id) ?? 0) + f.speed * dt) % 10000;
-      this.phase.set(f.id, phase);
-      f.line.style.strokeDashoffset = String(-phase);
-    }
   }
 
   private setHover(id: string | null, at: Point | null): void {
@@ -330,7 +505,8 @@ export class Board {
     }
     if (!this.pointers.has(e.pointerId)) return;
     const prev = this.pointers.get(e.pointerId)!;
-    this.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    const now = { x: e.clientX, y: e.clientY };
+    this.pointers.set(e.pointerId, now);
     const g = this.gesture;
     const threshold = e.pointerType === 'mouse' ? 4 : 8;
 
@@ -346,12 +522,13 @@ export class Board {
         break;
       }
       case 'pan':
-        this.camera.x += e.clientX - prev.x;
-        this.camera.y += e.clientY - prev.y;
+        this.camera.x += now.x - prev.x;
+        this.camera.y += now.y - prev.y;
+        if (dist(g.start, now) > threshold) g.tap = null;
         this.applyCamera();
         break;
       case 'press-element':
-        if (dist(g.start, { x: e.clientX, y: e.clientY }) > threshold) {
+        if (dist(g.start, now) > threshold) {
           this.gesture = { type: 'drag-element', id: g.id, origin: g.origin, grab: g.grab };
           this.dragTo(e);
         }
@@ -359,15 +536,24 @@ export class Board {
       case 'drag-element':
         this.dragTo(e);
         break;
+      case 'press-handle':
+        if (dist(g.start, now) > threshold) {
+          this.gesture = { type: 'drag-handle', id: g.id, end: g.end, origin: g.origin };
+          this.dragHandle(e);
+        }
+        break;
+      case 'drag-handle':
+        this.dragHandle(e);
+        break;
       case 'press-empty':
-        if (dist(g.start, { x: e.clientX, y: e.clientY }) > threshold) {
+        if (dist(g.start, now) > threshold) {
           this.gesture = { type: 'wire', from: g.from, to: this.toGrid(e.clientX, e.clientY) };
-          this.drawWirePreview();
+          this.layers.overlay.innerHTML = wirePreview(g.from, this.toGrid(e.clientX, e.clientY));
         }
         break;
       case 'wire':
         g.to = this.toGrid(e.clientX, e.clientY);
-        this.drawWirePreview();
+        this.layers.overlay.innerHTML = wirePreview(g.from, g.to);
         break;
     }
   }
@@ -381,15 +567,15 @@ export class Board {
     this.host.preview(move(g.origin, g.id, x, y));
   }
 
-  private drawWirePreview(): void {
+  private dragHandle(e: PointerEvent): void {
     const g = this.gesture;
-    if (g.type !== 'wire') return;
-    const { from: p, to: q } = g;
-    const pts = p.x === q.x || p.y === q.y ? [p, q] : [p, { x: q.x, y: p.y }, q];
-    const d = pts.map((pt, i) => `${i ? 'L' : 'M'}${pt.x * U} ${pt.y * U}`).join(' ');
-    this.layers.overlay.innerHTML = `<path class="wire-preview" d="${d}"/>
-      <circle class="wire-end" cx="${p.x * U}" cy="${p.y * U}" r="5"/>
-      <circle class="wire-end" cx="${q.x * U}" cy="${q.y * U}" r="5"/>`;
+    if (g.type !== 'drag-handle') return;
+    const w = g.origin.wires.find((x) => x.id === g.id)!;
+    const fixed = g.end === 1 ? { x: w.x2, y: w.y2 } : { x: w.x1, y: w.y1 };
+    const to = this.toGrid(e.clientX, e.clientY);
+    // Hide the old wire while the new path is previewed.
+    this.host.preview({ ...g.origin, wires: g.origin.wires.filter((x) => x.id !== g.id) });
+    this.layers.overlay.innerHTML = wirePreview(fixed, to);
   }
 
   private up(e: PointerEvent): void {
@@ -406,23 +592,31 @@ export class Board {
     if (!this.view) return;
 
     switch (g.type) {
-      case 'press-element': {
-        this.host.select(g.id);
-        const item = this.view.circuit.elements.find((x) => x.id === g.id);
-        if (item?.kind === 'switch') this.host.toggle(g.id);
+      case 'pan':
+        if (g.tap) this.tap(g.tap.element, g.tap.wire);
         break;
-      }
+      case 'press-element':
+        this.tap(g.id, null);
+        break;
       case 'drag-element': {
         const moved = this.view.circuit;
         const a = g.origin.elements.find((x) => x.id === g.id);
         const b = moved.elements.find((x) => x.id === g.id);
-        if (a && b && (a.x !== b.x || a.y !== b.y)) {
-          this.host.preview(g.origin);
-          this.host.commit(normalize(moved));
-        } else {
-          this.host.preview(g.origin);
-        }
+        this.host.preview(g.origin);
+        if (a && b && (a.x !== b.x || a.y !== b.y)) this.host.commit(normalize(moved));
         this.host.select(g.id);
+        break;
+      }
+      case 'press-handle':
+        break;
+      case 'drag-handle': {
+        this.host.preview(g.origin);
+        const next = moveWireEnd(g.origin, g.id, g.end, this.toGrid(e.clientX, e.clientY));
+        this.host.commit(next);
+        // Keep the moved wire selected: it is the one that now ends at the dropped point.
+        const to = this.toGrid(e.clientX, e.clientY);
+        const moved = next.wires.find((w) => (w.x1 === to.x && w.y1 === to.y) || (w.x2 === to.x && w.y2 === to.y));
+        this.host.select(moved?.id ?? null);
         break;
       }
       case 'press-empty':
@@ -431,6 +625,16 @@ export class Board {
       case 'wire':
         if (g.from.x !== g.to.x || g.from.y !== g.to.y) this.host.commit(addWire(this.view.circuit, g.from, g.to));
         break;
+    }
+  }
+
+  private tap(element: string | null, wire: string | null): void {
+    if (element) {
+      this.host.select(element);
+      const item = this.view?.circuit.elements.find((x) => x.id === element);
+      if (item?.kind === 'switch') this.host.toggle(element);
+    } else {
+      this.host.select(wire);
     }
   }
 
@@ -443,7 +647,7 @@ export class Board {
   /** Undoes the visual effect of an unfinished gesture. */
   private abortGesture(): void {
     const g = this.gesture;
-    if (g.type === 'drag-element' || g.type === 'press-element') this.host.preview(g.origin);
+    if (g.type === 'drag-element' || g.type === 'press-element' || g.type === 'drag-handle') this.host.preview(g.origin);
     this.layers.overlay.innerHTML = '';
   }
 
@@ -456,11 +660,21 @@ export class Board {
       this.applyCamera();
     }
   }
-
 }
 
-function valueText(e: Element): string {
-  if (e.kind === 'battery' && e.value !== undefined) return formatSI(e.value, 'V');
+/** Dashed preview of a wire from p to q, as addWire would draw it. */
+function wirePreview(p: Point, q: Point): string {
+  const pts = p.x === q.x || p.y === q.y ? [p, q] : [p, { x: q.x, y: p.y }, q];
+  const d = pts.map((pt, i) => `${i ? 'L' : 'M'}${pt.x * U} ${pt.y * U}`).join(' ');
+  return `<path class="wire-preview" d="${d}"/>
+    <circle class="wire-end" cx="${p.x * U}" cy="${p.y * U}" r="5"/>
+    <circle class="wire-end" cx="${q.x * U}" cy="${q.y * U}" r="5"/>`;
+}
+
+export function valueText(e: Element): string {
+  const r = e.r ? ` r ${formatSI(e.r, 'Ω')}` : '';
+  if (e.kind === 'battery' && e.value !== undefined) return formatSI(e.value, 'V') + r;
+  if (e.kind === 'ac' && e.value !== undefined) return `${formatSI(e.value, 'V')}~ ${formatSI(e.freq ?? 50, 'Hz')}${r}`;
   if ((e.kind === 'resistor' || e.kind === 'lamp') && e.value !== undefined) return formatSI(e.value, 'Ω');
   return '';
 }

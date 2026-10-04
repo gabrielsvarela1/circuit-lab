@@ -13,6 +13,7 @@
       <nav class="learn">
         <button data-cmd="examples">Exemplos</button>
         <button data-cmd="exercises">Exercícios</button>
+        <button data-cmd="theme">Tema escuro</button>
       </nav>
       <nav class="toolbar">
         <button data-cmd="undo" title="Anular (Ctrl+Z)">Anular</button>
@@ -25,13 +26,16 @@
       <aside class="palette" aria-label="Componentes"></aside>
       <section class="stage">
         <div class="status" role="status" hidden></div>
-        <svg class="board" aria-label="Grelha do circuito"></svg>
+        <svg class="board" tabindex="0" role="application" aria-label="Grelha do circuito. Setas movem o cursor, Enter desenha fios, Espaço escolhe um componente." aria-describedby="sr-status"></svg>
         <div class="tooltip" hidden></div>
         <div class="zoom">
           <button data-cmd="zoom-in" aria-label="Aproximar">+</button>
           <button data-cmd="zoom-out" aria-label="Afastar">−</button>
           <button data-cmd="fit" aria-label="Ajustar à vista">Ajustar</button>
+          <button data-cmd="pan" aria-pressed="false">Mover vista</button>
         </div>
+        <p class="note" hidden></p>
+        <p class="sr-status visually-hidden" id="sr-status" aria-live="polite"></p>
       </section>
       <section class="exercise" aria-label="Exercício" hidden></section>
       <aside class="panel"></aside>

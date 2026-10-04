@@ -1,5 +1,6 @@
 import './style.css';
-import { type SolveResult, solveWithBurnout } from './engine';
+import { type Part, type SolveResult, solve, solveWithBurnout } from './engine';
+import { formatSI } from './format';
 import { EXAMPLES } from './examples';
 import { History } from './history';
 import {
@@ -31,6 +32,10 @@ class App {
   draft: Circuit | null = null;
   selected: string | null = null;
   result: SolveResult | null = null;
+  /** Netlist of the circuit on screen, with burnt parts marked; reused by the AC animation. */
+  private parts: Part[] = [];
+  /** Simulated time for AC circuits, in seconds. */
+  private simTime = 0;
   showValues = true;
   board: Board;
   panel: Panel;
@@ -64,6 +69,9 @@ class App {
         const e = this.circuit.elements.find((x) => x.id === id);
         if (e) this.commit(update(this.circuit, id, { closed: !e.closed }));
       },
+      announce: (text) => {
+        document.querySelector<HTMLElement>('.sr-status')!.textContent = text;
+      },
     });
     this.panel = new Panel(document.querySelector<HTMLElement>('.panel')!, {
       change: (id, patch) => this.commit(update(this.circuit, id, patch)),
@@ -84,7 +92,15 @@ class App {
     this.buildPalette();
     this.buildExamples();
     this.bindCommands();
-    document.addEventListener('pointerdown', (e) => (this.lastPointer = e.pointerType), true);
+    document.addEventListener(
+      'pointerdown',
+      (e) => {
+        this.lastPointer = e.pointerType;
+        this.board.keyboardUsed = false;
+      },
+      true,
+    );
+    this.applyTheme();
     window.addEventListener('resize', () => this.updateTooltip());
     this.animate();
     this.render();
@@ -123,26 +139,37 @@ class App {
 
   render(): void {
     let circuit = this.circuit;
-    const { result, burnt } = solveWithBurnout(toParts(circuit));
+    const { result, burnt, parts } = solveWithBurnout(toParts(circuit));
     if (burnt.length) {
-      // A burnt LED stays burnt: it becomes part of the circuit state.
+      // A burnt LED or lamp stays burnt: it becomes part of the circuit state.
       circuit = { ...circuit, elements: circuit.elements.map((e) => (burnt.includes(e.id) ? { ...e, burnt: true } : e)) };
       if (this.draft) this.draft = circuit;
       else this.history.replace(circuit);
-      this.toast(`O LED ${burnt.map((id) => circuit.elements.find((e) => e.id === id)?.name).join(', ')} queimou.`);
+      const names = (kind: string) =>
+        circuit.elements.filter((e) => burnt.includes(e.id) && e.kind === kind).map((e) => e.name);
+      const leds = names('led');
+      const lamps = names('lamp');
+      this.toast(
+        [leds.length ? `O LED ${leds.join(', ')} queimou.` : '', lamps.length ? `A lâmpada ${lamps.join(', ')} fundiu.` : '']
+          .filter(Boolean)
+          .join(' '),
+      );
     }
     this.result = result;
+    this.parts = parts;
+    this.updateAcNote();
     if (this.selected && !circuit.elements.some((e) => e.id === this.selected) && !circuit.wires.some((w) => w.id === this.selected)) {
       this.selected = null;
     }
 
-    this.board.render({ circuit, result, selected: this.selected, showValues: this.showValues });
+    this.board.render({ circuit, result, live: this.liveResult(), selected: this.selected, showValues: this.showValues });
     this.panel.render(
       circuit,
       this.selected,
       this.selected ? result.parts.get(this.selected) : undefined,
       this.showValues,
       result.status !== 'short' && result.status !== 'error',
+      result.ac,
     );
 
     const message = statusMessage(circuit, result);
@@ -193,16 +220,69 @@ class App {
     this.tooltip.style.transform = `translate(${left}px, ${top}px)`;
   }
 
+  /** Highest AC frequency in the circuit, or 0. */
+  private acFrequency(): number {
+    return Math.max(0, ...this.parts.filter((p) => p.kind === 'ac').map((p) => p.freq ?? 50));
+  }
+
+  /**
+   * AC is animated in slow motion: anything faster than 1 Hz is shown at 1 Hz,
+   * so the dots visibly change direction and LEDs blink.
+   */
+  private timeScale(): number {
+    const f = this.acFrequency();
+    return f > 1 ? 1 / f : 1;
+  }
+
+  /** The circuit at the current simulated instant, for AC circuits that work. */
+  private liveResult(): SolveResult | null {
+    if (!this.result?.ac || this.result.status !== 'ok') return null;
+    return solve(this.parts, this.simTime);
+  }
+
+  private updateAcNote(): void {
+    const note = document.querySelector<HTMLElement>('.note')!;
+    const f = this.acFrequency();
+    note.hidden = !this.result?.ac;
+    if (note.hidden) return;
+    const speed = f > 1 ? ', mostrada em câmara lenta a 1 Hz' : '';
+    note.textContent = `Corrente alternada a ${formatSI(f, 'Hz')}${speed}. Os aparelhos mostram valores eficazes.`;
+  }
+
   private animate(): void {
     const still = window.matchMedia('(prefers-reduced-motion: reduce)');
     let last = performance.now();
     const frame = (now: number) => {
       const dt = Math.min(0.1, (now - last) / 1000);
       last = now;
-      if (!still.matches) this.board.tick(dt);
+      if (!still.matches) {
+        if (this.result?.ac && this.result.status === 'ok' && !this.draft) {
+          this.simTime += dt * this.timeScale();
+          this.board.updateLive(this.liveResult());
+        }
+        this.board.tick(dt);
+      }
       requestAnimationFrame(frame);
     };
     requestAnimationFrame(frame);
+  }
+
+  /** Light, dark, or the system setting when nothing was chosen. */
+  private applyTheme(): void {
+    let chosen: string | null = null;
+    try {
+      chosen = localStorage.getItem('circuit-lab-theme');
+    } catch {
+      // No storage: follow the system.
+    }
+    if (chosen === 'light' || chosen === 'dark') document.documentElement.dataset.theme = chosen;
+    const button = document.querySelector<HTMLButtonElement>('[data-cmd=theme]')!;
+    button.textContent = this.isDark() ? 'Tema claro' : 'Tema escuro';
+  }
+
+  private isDark(): boolean {
+    const t = document.documentElement.dataset.theme;
+    return t ? t === 'dark' : window.matchMedia('(prefers-color-scheme: dark)').matches;
   }
 
   toast(text: string): void {
@@ -215,7 +295,8 @@ class App {
 
   add(kind: ElementKind): void {
     const c = this.circuit;
-    const at = freeSpot(c, this.board.centre());
+    // From the keyboard, place it next to the board's cursor.
+    const at = freeSpot(c, this.board.keyboardUsed ? this.board.cursor : this.board.centre());
     const e = createElement(c, kind, at.x, at.y, kind === 'battery' ? 1 : 0);
     this.selected = e.id;
     this.commit(normalize({ ...c, elements: [...c.elements, e] }));
@@ -310,6 +391,22 @@ class App {
       'zoom-in': () => this.board.zoom(1.25),
       'zoom-out': () => this.board.zoom(0.8),
       fit: () => this.board.fit(this.circuit),
+      pan: () => {
+        this.board.panMode = !this.board.panMode;
+        const button = document.querySelector<HTMLElement>('[data-cmd=pan]')!;
+        button.setAttribute('aria-pressed', String(this.board.panMode));
+        this.board.svg.classList.toggle('panning', this.board.panMode);
+      },
+      theme: () => {
+        const next = this.isDark() ? 'light' : 'dark';
+        try {
+          localStorage.setItem('circuit-lab-theme', next);
+        } catch {
+          // Not remembered, but still applied below.
+        }
+        document.documentElement.dataset.theme = next;
+        this.applyTheme();
+      },
     };
     document.addEventListener('click', (e) => {
       const button = (e.target as HTMLElement).closest<HTMLElement>('[data-cmd]');
@@ -317,9 +414,22 @@ class App {
       if (cmd && commands[cmd]) commands[cmd]();
     });
 
+    document.addEventListener('keyup', (e) => {
+      if (e.key === ' ') {
+        this.board.spaceHeld = false;
+        this.board.svg.classList.toggle('panning', this.board.panMode);
+      }
+    });
     document.addEventListener('keydown', (e) => {
       const target = e.target as HTMLElement;
       if (target.matches('input, select, textarea')) return;
+      // Space held down: drag with the mouse to move the view.
+      if (e.key === ' ' && !target.matches('button, a, summary')) {
+        this.board.spaceHeld = true;
+        this.board.svg.classList.add('panning');
+        e.preventDefault();
+        return;
+      }
       const ctrl = e.ctrlKey || e.metaKey;
       if (ctrl && e.key.toLowerCase() === 'z' && !e.shiftKey) commands.undo();
       else if (ctrl && (e.key.toLowerCase() === 'y' || (e.key.toLowerCase() === 'z' && e.shiftKey))) commands.redo();
