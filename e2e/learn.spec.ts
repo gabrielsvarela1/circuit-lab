@@ -11,7 +11,7 @@ async function loadExample(page: Page, title: string) {
 
 test('examples load with one click and show the expected readings', async ({ page }, info) => {
   await page.click('[data-cmd=examples]');
-  await expect(page.locator('dialog.examples .example-list button')).toHaveCount(7);
+  await expect(page.locator('dialog.examples .example-list button')).toHaveCount(9);
   await shot(page, info, 'examples');
   await page.click('[data-cmd=close-examples]');
 
