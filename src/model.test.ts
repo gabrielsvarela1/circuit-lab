@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { solve } from './engine';
 import { EXAMPLES } from './examples';
-import { addWire, createElement, empty, move, normalize, rotate, terminals, toParts } from './model';
+import { addWire, createElement, empty, itemAt, move, moveWireEnd, normalize, rotate, terminals, toParts } from './model';
 import { decode, encode } from './share';
 
 describe('model', () => {
@@ -38,7 +38,11 @@ describe('model', () => {
     const r = createElement(c, 'resistor', 2, 0);
     c = addWire({ ...c, elements: [r] }, { x: -2, y: 0 }, { x: 1, y: 0 });
     c = move(c, r.id, 2, 1);
-    expect(c.wires[0]).toMatchObject({ x1: -2, y1: 0, x2: 1, y2: 1 });
+    // The horizontal wire keeps its direction and turns down to the new terminal.
+    expect(c.wires.map((w) => [w.x1, w.y1, w.x2, w.y2])).toEqual([
+      [-2, 0, 1, 0],
+      [1, 0, 1, 1],
+    ]);
   });
 
   it('rotating turns the terminals around the centre', () => {
@@ -76,5 +80,45 @@ describe('examples', () => {
     const r = solve(toParts(example.build()));
     expect(r.status).toBe('ok');
     expect(r.converged).toBe(true);
+  });
+});
+
+describe('wire ends and lookup', () => {
+  it('moving a wire end redraws it from the other end', () => {
+    const c = addWire(empty(), { x: 0, y: 0 }, { x: 4, y: 0 });
+    const moved = moveWireEnd(c, c.wires[0].id, 2, { x: 4, y: 2 });
+    expect(moved.wires.map((w) => [w.x1, w.y1, w.x2, w.y2])).toEqual([
+      [0, 0, 4, 0],
+      [4, 0, 4, 2],
+    ]);
+  });
+
+  it('finds the element centred on a point, or a wire through it', () => {
+    const r = createElement(empty(), 'resistor', 2, 2);
+    const c = addWire({ elements: [r], wires: [] }, { x: 0, y: 5 }, { x: 6, y: 5 });
+    expect(itemAt(c, { x: 2, y: 2 })).toBe(r.id);
+    expect(itemAt(c, { x: 3, y: 5 })).toBe(c.wires[0].id);
+    expect(itemAt(c, { x: 3, y: 4 })).toBeNull();
+  });
+});
+
+describe('share, newer fields', () => {
+  it('keeps internal resistance and AC frequency', () => {
+    const c = {
+      elements: [
+        { ...createElement(empty(), 'battery', 0, 0, 1), r: 0.5 },
+        { ...createElement(empty(), 'ac', 4, 0, 1), freq: 60, r: 2 },
+      ],
+      wires: [],
+    };
+    const back = decode(encode(c))!;
+    expect(back.elements[0]).toMatchObject({ kind: 'battery', r: 0.5 });
+    expect(back.elements[1]).toMatchObject({ kind: 'ac', freq: 60, r: 2, value: 6 });
+  });
+
+  it('still reads links made before AC sources existed', () => {
+    // {"e":[[1,"R1",0,0,0,100,null]],"w":[]}: kind 1 was, and still is, a resistor.
+    const old = btoa(JSON.stringify({ e: [[1, 'R1', 0, 0, 0, 100, null]], w: [] }));
+    expect(decode(old)!.elements[0]).toMatchObject({ kind: 'resistor', value: 100 });
   });
 });

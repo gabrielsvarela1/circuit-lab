@@ -19,6 +19,8 @@ export interface Element {
   y: number;
   rot: Rotation;
   value?: number;
+  r?: number;
+  freq?: number;
   closed?: boolean;
   vf?: number;
   burnt?: boolean;
@@ -38,10 +40,11 @@ export interface Circuit {
   wires: Wire[];
 }
 
-export const KINDS: ElementKind[] = ['battery', 'resistor', 'lamp', 'led', 'switch', 'ammeter', 'voltmeter'];
+export const KINDS: ElementKind[] = ['battery', 'ac', 'resistor', 'lamp', 'led', 'switch', 'ammeter', 'voltmeter'];
 
 export const LABELS: Record<ElementKind, string> = {
   battery: 'Pilha',
+  ac: 'Fonte CA',
   resistor: 'Resistência',
   lamp: 'Lâmpada',
   led: 'LED',
@@ -52,6 +55,7 @@ export const LABELS: Record<ElementKind, string> = {
 
 const PREFIX: Record<ElementKind, string> = {
   battery: 'E',
+  ac: 'G',
   resistor: 'R',
   lamp: 'L',
   led: 'D',
@@ -62,6 +66,7 @@ const PREFIX: Record<ElementKind, string> = {
 
 const DEFAULTS: Record<ElementKind, Partial<Element>> = {
   battery: { value: 9 },
+  ac: { value: 6, freq: 50 },
   resistor: { value: 100 },
   lamp: { value: 30, rated: 9 },
   led: { vf: 1.8 },
@@ -128,6 +133,8 @@ export function toParts(c: Circuit): Part[] {
       a: key(a),
       b: key(b),
       value: e.value,
+      r: e.r,
+      freq: e.freq,
       closed: e.closed,
       vf: e.vf,
       burnt: e.burnt,
@@ -157,16 +164,39 @@ export function remove(c: Circuit, id: string): Circuit {
   };
 }
 
-/** Moves wire endpoints sitting on `from[i]` to `to[i]`, so wires stay attached. */
+/**
+ * Moves wire endpoints sitting on `from[i]` to `to[i]`, so wires stay
+ * attached. A straight wire that would turn diagonal becomes an L instead:
+ * it keeps its direction from the end that did not move and turns at the end.
+ */
 function dragWires(wires: Wire[], from: Point[], to: Point[]): Wire[] {
-  return wires.map((w) => {
+  const out: Wire[] = [];
+  for (const w of wires) {
     let { x1, y1, x2, y2 } = w;
     from.forEach((f, i) => {
-      if (x1 === f.x && y1 === f.y) ({ x: x1, y: y1 } = to[i]);
-      if (x2 === f.x && y2 === f.y) ({ x: x2, y: y2 } = to[i]);
+      if (w.x1 === f.x && w.y1 === f.y) ({ x: x1, y: y1 } = to[i]);
+      if (w.x2 === f.x && w.y2 === f.y) ({ x: x2, y: y2 } = to[i]);
     });
-    return x1 === w.x1 && y1 === w.y1 && x2 === w.x2 && y2 === w.y2 ? w : { ...w, x1, y1, x2, y2 };
-  });
+    if (x1 === w.x1 && y1 === w.y1 && x2 === w.x2 && y2 === w.y2) {
+      out.push(w);
+      continue;
+    }
+    const straight = w.x1 === w.x2 || w.y1 === w.y2;
+    const diagonal = x1 !== x2 && y1 !== y2;
+    const oneEndMoved = (x1 === w.x1 && y1 === w.y1) || (x2 === w.x2 && y2 === w.y2);
+    if (!straight || !diagonal || !oneEndMoved) {
+      out.push({ ...w, x1, y1, x2, y2 });
+      continue;
+    }
+    // Fixed end F, moved end M: keep the original direction from F, then turn towards M.
+    const fixedFirst = x1 === w.x1 && y1 === w.y1;
+    const F = fixedFirst ? { x: x1, y: y1 } : { x: x2, y: y2 };
+    const M = fixedFirst ? { x: x2, y: y2 } : { x: x1, y: y1 };
+    const corner = w.y1 === w.y2 ? { x: M.x, y: F.y } : { x: F.x, y: M.y };
+    out.push({ id: w.id, x1: F.x, y1: F.y, x2: corner.x, y2: corner.y });
+    out.push({ id: newId(), x1: corner.x, y1: corner.y, x2: M.x, y2: M.y });
+  }
+  return out;
 }
 
 /** Moves an element; wires attached to its terminals follow. */
@@ -202,6 +232,30 @@ export function addWire(c: Circuit, p: Point, q: Point): Circuit {
     wires.push({ id: newId(), x1: q.x, y1: p.y, x2: q.x, y2: q.y });
   }
   return normalize({ ...c, wires });
+}
+
+/**
+ * Moves one end of a wire to `p`. The other end stays put and the wire is
+ * redrawn from it, as an L if the two points are not aligned.
+ */
+export function moveWireEnd(c: Circuit, id: string, end: 1 | 2, p: Point): Circuit {
+  const w = c.wires.find((x) => x.id === id);
+  if (!w) return c;
+  const fixed = end === 1 ? { x: w.x2, y: w.y2 } : { x: w.x1, y: w.y1 };
+  return addWire({ ...c, wires: c.wires.filter((x) => x.id !== id) }, fixed, p);
+}
+
+/** Element centred on `p`, or the wire that passes through `p`. */
+export function itemAt(c: Circuit, p: Point): string | null {
+  const e = c.elements.find((el) => el.x === p.x && el.y === p.y);
+  if (e) return e.id;
+  const w = c.wires.find((wi) => {
+    const cross = (wi.x2 - wi.x1) * (p.y - wi.y1) - (wi.y2 - wi.y1) * (p.x - wi.x1);
+    const within =
+      Math.min(wi.x1, wi.x2) <= p.x && p.x <= Math.max(wi.x1, wi.x2) && Math.min(wi.y1, wi.y2) <= p.y && p.y <= Math.max(wi.y1, wi.y2);
+    return cross === 0 && within;
+  });
+  return w?.id ?? null;
 }
 
 /** Grid points strictly inside the segment, in order from (x1, y1). */

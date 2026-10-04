@@ -1,22 +1,37 @@
-import { type Circuit, type Element, type ElementKind, KINDS, newId, type Rotation } from './model';
+import { type Circuit, type Element, type ElementKind, newId, type Rotation } from './model';
+
+/** Kind codes. New kinds go at the end so old links keep working. */
+const CODES: ElementKind[] = ['battery', 'resistor', 'lamp', 'led', 'switch', 'ammeter', 'voltmeter', 'ac'];
 
 /**
  * Compact text form of a circuit, used in the URL and in localStorage:
- * { e: [[kind, name, x, y, rot, value, extra]], w: [[x1, y1, x2, y2]] }
- * where extra is the switch state, the LED forward voltage or the lamp rating.
+ * { e: [[kind, name, x, y, rot, value, extra, r]], w: [[x1, y1, x2, y2]] }
+ * where extra is the switch state, the LED forward voltage, the lamp rating
+ * or the AC frequency, and r is a generator's internal resistance.
  */
-type Row = [number, string, number, number, number, number | null, number | null];
+type Row = [number, string, number, number, number, number | null, number | null, number?];
 
 export function encode(c: Circuit): string {
   const e: Row[] = c.elements.map((el) => [
-    KINDS.indexOf(el.kind),
+    CODES.indexOf(el.kind),
     el.name,
     el.x,
     el.y,
     el.rot,
     el.value ?? null,
-    el.kind === 'switch' ? (el.closed ? 1 : 0) : el.kind === 'led' ? el.vf ?? null : el.kind === 'lamp' ? el.rated ?? null : null,
-  ]);
+    el.kind === 'switch'
+      ? el.closed
+        ? 1
+        : 0
+      : el.kind === 'led'
+        ? el.vf ?? null
+        : el.kind === 'lamp'
+          ? el.rated ?? null
+          : el.kind === 'ac'
+            ? el.freq ?? null
+            : null,
+    ...(el.r ? [el.r] : []),
+  ] as Row);
   const w = c.wires.map((wi) => [wi.x1, wi.y1, wi.x2, wi.y2]);
   return toBase64Url(JSON.stringify({ e, w }));
 }
@@ -28,14 +43,16 @@ export function decode(text: string): Circuit | null {
     const num = (v: unknown) => typeof v === 'number' && Number.isFinite(v);
     const elements: Element[] = [];
     for (const row of data.e ?? []) {
-      const [k, name, x, y, rot, value, extra] = row as Row;
-      const kind: ElementKind | undefined = KINDS[k];
+      const [k, name, x, y, rot, value, extra, r] = row as Row;
+      const kind: ElementKind | undefined = CODES[k];
       if (!kind || typeof name !== 'string' || !num(x) || !num(y) || ![0, 1, 2, 3].includes(rot)) continue;
       const el: Element = { id: newId(), kind, name: name.slice(0, 8), x, y, rot: rot as Rotation };
       if (num(value)) el.value = value!;
       if (kind === 'switch') el.closed = extra === 1;
       if (kind === 'led') el.vf = num(extra) ? extra! : 1.8;
       if (kind === 'lamp' && num(extra)) el.rated = extra!;
+      if (kind === 'ac') el.freq = num(extra) && extra! > 0 ? extra! : 50;
+      if ((kind === 'battery' || kind === 'ac') && num(r) && r! > 0) el.r = r;
       elements.push(el);
     }
     const wires = [];

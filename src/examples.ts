@@ -1,6 +1,6 @@
 import { type Circuit, type Element, type ElementKind, newId, normalize, type Rotation, type Wire } from './model';
 
-type Props = Partial<Pick<Element, 'value' | 'closed' | 'vf' | 'rated'>>;
+type Props = Partial<Pick<Element, 'value' | 'closed' | 'vf' | 'rated' | 'r' | 'freq'>>;
 
 export function el(kind: ElementKind, name: string, x: number, y: number, rot: Rotation, props: Props = {}): Element {
   return { id: newId(), kind, name, x, y, rot, ...props };
@@ -200,6 +200,38 @@ export const EXAMPLES: Example[] = [
         );
       });
       return circuit(elements, path([0, 0], [0, -2], [9, -2]), path([0, 2], [0, 4], [9, 4]));
+    },
+  },
+  {
+    title: 'Corrente alternada e dois LEDs',
+    description: 'Uma fonte de 6 V a 1 Hz e dois LEDs em sentidos opostos: cada um acende em metade do ciclo.',
+    build: () =>
+      circuit(
+        [
+          el('ac', 'G1', 0, 0, 1, { value: 6, freq: 1 }),
+          el('resistor', 'R1', 3, -3, 0, { value: 330 }),
+          el('led', 'D1', 6, 0, 1, { vf: 1.8 }),
+          el('led', 'D2', 8, 0, 3, { vf: 2.2 }),
+        ],
+        path([0, -1], [0, -3], [2, -3]),
+        path([4, -3], [8, -3], [8, -1]),
+        path([6, -3], [6, -1]),
+        path([8, 1], [8, 3], [0, 3], [0, 1]),
+        path([6, 1], [6, 3]),
+      ),
+  },
+  {
+    title: 'Pilha com resistência interna',
+    description: 'Uma pilha de 9 V com 1 Ω por dentro: com 1 A, aos terminais ficam só 8 V.',
+    build: () => {
+      const c = seriesLoop(
+        9,
+        2,
+        el('lamp', 'L1', 6, 0, 1, { value: 6, rated: 9 }),
+        [el('voltmeter', 'V1', -3, 0, 1)],
+        [path([0, -1], [-3, -1]), path([0, 1], [-3, 1])],
+      );
+      return { ...c, elements: c.elements.map((e) => (e.name === 'E1' ? { ...e, r: 1 } : e)) };
     },
   },
 ];
