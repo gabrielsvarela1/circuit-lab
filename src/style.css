@@ -634,6 +634,10 @@ dialog.examples::backdrop {
   white-space: nowrap;
 }
 
+.board:focus:not(:focus-visible) {
+  outline: none;
+}
+
 .board:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: -2px;
